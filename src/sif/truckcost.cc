@@ -97,6 +97,13 @@ constexpr ranged_default_t<float> kUseTollsRange{0.f, kDefaultUseTolls, 1.0f};
 constexpr ranged_default_t<uint32_t> kAxleCountRange{2, kDefaultAxleCount, 20};
 constexpr ranged_default_t<float> kUseHighwaysRange{0.f, kDefaultUseHighways, 1.0f};
 constexpr ranged_default_t<float> kTopSpeedRange{10.f, kMaxAssumedTruckSpeed, kMaxSpeedKph};
+
+// TruckMate custom costing (FR-OSMNAV-022 / TR-OSMNAV-LEFTTURN-033): unprotected-left avoidance.
+// The avoidance detour threshold is supplied in meters and converted to a finite penalty using a
+// nominal surface-street speed, so the engine takes an unprotected left only when avoiding it would
+// detour more than roughly that distance of travel.
+constexpr float kUnprotectedLeftReferenceSpeedMps = 13.4f; // ~30 mph
+constexpr ranged_default_t<float> kUnprotectedLeftAvoidanceRange{0.f, 0.f, 1000000.f};
 constexpr ranged_default_t<float> kHGVNoAccessRange{0.f, kMaxPenalty, kMaxPenalty};
 constexpr ranged_default_t<float> kUseTruckRouteRange{0.f, kDefaultUseTruckRoute, 1.0f};
 
@@ -319,6 +326,10 @@ public:
   float toll_factor_;       // Factor applied when road has a toll
   float low_class_penalty_; // Penalty (seconds) to go to residential or service road
 
+  // TruckMate custom costing (FR-OSMNAV-022).
+  float unprotected_left_avoidance_meters_; // Detour threshold (meters); 0 disables the rule.
+  bool enable_static_friction_;             // When false, comfort friction (low-class penalty) is off.
+
   // Vehicle attributes (used for special restrictions and costing)
   bool hazmat_;                  // Carrying hazardous materials
   float weight_;                 // Vehicle weight in metric tons
@@ -358,6 +369,10 @@ TruckCost::TruckCost(const Costing& costing)
   width_ = costing_options.width();
   length_ = costing_options.length();
   axle_count_ = costing_options.axle_count();
+
+  // TruckMate custom costing options.
+  unprotected_left_avoidance_meters_ = costing_options.unprotected_left_avoidance_meters();
+  enable_static_friction_ = costing_options.enable_static_friction();
 
   // Create speed cost table
   // Preference to use highways. Is a value from 0 to 1
@@ -574,9 +589,24 @@ Cost TruckCost::TransitionCost(const baldr::DirectedEdge* edge,
   Cost c = base_transition_cost(node, edge, &pred, idx);
   c.secs += OSRMCarTurnDuration(edge, node, idx);
 
-  // Penalty to transition onto low class roads.
-  if (edge->classification() == baldr::RoadClass::kResidential ||
-      edge->classification() == baldr::RoadClass::kServiceOther) {
+  // TruckMate (TR-OSMNAV-LEFTTURN-033): avoid unprotected left turns. A left is protected only
+  // when the intersection is signalized; per the data-fidelity gate (TR-OSMNAV-DATAFIDELITY-035)
+  // an untagged/uncertain conflicting approach is treated as unprotected (conservative fallback,
+  // never wrongly permits an unprotected left). The finite penalty, sized to the configured detour
+  // distance, makes A* take the left only when avoiding it would cost more than that distance.
+  if (unprotected_left_avoidance_meters_ > 0.f) {
+    const auto truckmate_turn = edge->turntype(idx);
+    if ((truckmate_turn == baldr::Turn::Type::kLeft ||
+         truckmate_turn == baldr::Turn::Type::kSharpLeft) &&
+        !node->traffic_signal()) {
+      c.cost += unprotected_left_avoidance_meters_ / kUnprotectedLeftReferenceSpeedMps;
+    }
+  }
+
+  // Penalty to transition onto low class roads (TruckMate: gated by static-friction toggle).
+  if (enable_static_friction_ &&
+      (edge->classification() == baldr::RoadClass::kResidential ||
+       edge->classification() == baldr::RoadClass::kServiceOther)) {
     c.cost += low_class_penalty_;
   }
 
@@ -654,9 +684,10 @@ Cost TruckCost::TransitionCostReverse(const uint32_t idx,
   Cost c = base_transition_cost(node, edge, pred, idx);
   c.secs += OSRMCarTurnDuration(edge, node, pred->opp_local_idx());
 
-  // Penalty to transition onto low class roads.
-  if (edge->classification() == baldr::RoadClass::kResidential ||
-      edge->classification() == baldr::RoadClass::kServiceOther) {
+  // Penalty to transition onto low class roads (TruckMate: gated by static-friction toggle).
+  if (enable_static_friction_ &&
+      (edge->classification() == baldr::RoadClass::kResidential ||
+       edge->classification() == baldr::RoadClass::kServiceOther)) {
     c.cost += low_class_penalty_;
   }
 
@@ -751,6 +782,11 @@ void ParseTruckCostOptions(const rapidjson::Document& doc,
                           hgv_no_access_penalty, warnings);
   JSON_PBF_RANGED_DEFAULT_V2(co, kUseTruckRouteRange, json, "/use_truck_route", use_truck_route,
                              warnings);
+  // TruckMate custom costing options (TR-OSMNAV-COSTING-032).
+  JSON_PBF_RANGED_DEFAULT(co, kUnprotectedLeftAvoidanceRange, json,
+                          "/unprotected_left_avoidance_meters", unprotected_left_avoidance_meters,
+                          warnings);
+  JSON_PBF_DEFAULT_V2(co, true, json, "/enable_static_friction", enable_static_friction);
 }
 
 cost_ptr_t CreateTruckCost(const Costing& costing_options) {
@@ -814,6 +850,16 @@ TEST(TruckCost, testTruckCostParams) {
     ctorTester.reset(make_truckcost_from_json("maneuver_penalty", (*distributor)(generator)));
     EXPECT_THAT(ctorTester->maneuver_penalty_,
                 test::IsBetween(defaults.maneuver_penalty_.min, defaults.maneuver_penalty_.max));
+  }
+
+  // TruckMate: unprotected_left_avoidance_meters_ (TR-OSMNAV-COSTING-032 / TEST-OSMNAV-044)
+  distributor.reset(make_distributor_from_range(kUnprotectedLeftAvoidanceRange));
+  for (unsigned i = 0; i < testIterations; ++i) {
+    ctorTester.reset(
+        make_truckcost_from_json("unprotected_left_avoidance_meters", (*distributor)(generator)));
+    EXPECT_THAT(ctorTester->unprotected_left_avoidance_meters_,
+                test::IsBetween(kUnprotectedLeftAvoidanceRange.min,
+                                kUnprotectedLeftAvoidanceRange.max));
   }
 
   // alley_penalty_

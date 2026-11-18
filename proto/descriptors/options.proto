@@ -357,6 +357,16 @@ message Costing {
     oneof has_multimodal_start_end_max_distance {
       uint32 multimodal_start_end_max_distance = 96;
     }
+    // TruckMate custom costing (sharpninja/valhalla): detour threshold (meters) above which an
+    // unprotected left turn is allowed; 0/absent disables the rule. See TRUCKMATE-COSTING-NOTES.md.
+    oneof has_unprotected_left_avoidance_meters {
+      float unprotected_left_avoidance_meters = 97;
+    }
+    // TruckMate custom costing: when false, comfort/static friction biases are not applied
+    // (Class-4+/over-height profile). The unprotected-left rule is independent of this flag.
+    oneof has_enable_static_friction {
+      bool enable_static_friction = 98;
+    }
   }
 
   oneof has_options {
